@@ -13,6 +13,15 @@ import matplotlib.pyplot as plt
 
 CSV_PATH = 'nacc.synthseg.notnormcog.zscore.csv'   # adjust path if needed
 MODEL_PATH = os.path.join('../saved_models_different', 'best_model.pt')
+# ---- DEFINE GROUPS (from R) ----
+groups = [
+    ["csf","total.intracranial"],
+    ["ctx.rh.insula","ctx.lh.insula","ctx.rh.superiortemporal",            
+    "ctx.lh.parahippocampal","ctx.lh.rostralanteriorcingulate","ctx.rh.rostralanteriorcingulate",
+    "ctx.rh.lateralorbitofrontal","ctx.rh.pericalcarine","ctx.rh.inferiortemporal","ctx.rh.paracentral"],
+    ["left.inferior.lateral.ventricle","right.inferior.lateral.ventricle"],
+    ["right.hippocampus","right.amygdala"],
+]
 
 # runtime options
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -109,37 +118,67 @@ def compute_mae_preds(model, X_tensor, y_tensor):
     return mae, preds, targs
     
 
-def permutation_importance(model, X_tensor, y_tensor, feat_names, repeats=5, out_dir=None,SEED=42,stem="run"):
+def permutation_importance(model, X_tensor, y_tensor, feat_names, repeats=5, out_dir=None, stem="run", seed=42, groups=None):
     base_mae, _, _ = compute_mae_preds(model, X_tensor, y_tensor)
-    print("Base MAE (units matching model outputs):", base_mae)
+    print("Base MAE:", base_mae)
+
     x_np = X_tensor.cpu().numpy()
+    feat_to_idx = {f: i for i, f in enumerate(feat_names)}
     importances = []
-    D = x_np.shape[1]
-    for i, name in enumerate(feat_names):
-        deltas = []
-        for r in range(repeats):
-            arr = x_np.copy()
-            rng = np.random.RandomState(SEED + r)
-            rng.shuffle(arr[:, i])
-            mae_shuf, _, _ = compute_mae_preds(model, torch.tensor(arr, dtype=torch.float32), y_tensor)
-            deltas.append(mae_shuf - base_mae)
-        importances.append((name, float(np.mean(deltas)), float(np.std(deltas))))
-        imp_df = pd.DataFrame(importances, columns=['feature','mae_increase','std']).sort_values('mae_increase', ascending=False)
-        imp_df.to_csv(os.path.join(out_dir, f'{stem}_permutation_importance.csv'), index=False)
-    topk = imp_df.head(30)
-    plt.figure(figsize=(8,6))
-    plt.barh(topk['feature'][::-1], topk['mae_increase'][::-1])
-    plt.xlabel('Increase in MAE')
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f'{stem}_permutation_importance.png'))
-    plt.close()
-    print("Saved permutation_importance_fullcsv.csv and PNG")
+
+    # ---- GROUPED PERMUTATION ----
+    if groups is not None:
+        for group in groups:
+            idxs = [feat_to_idx[f] for f in group if f in feat_to_idx]
+            if not idxs:
+                continue
+
+            deltas = []
+            for r in range(repeats):
+                arr = x_np.copy()
+                rng = np.random.RandomState(seed + r)
+
+                perm = rng.permutation(arr.shape[0])
+                for idx in idxs:
+                    arr[:, idx] = arr[perm, idx]
+
+                mae_shuf, _, _ = compute_mae_preds(
+                    model, torch.tensor(arr, dtype=torch.float32), y_tensor
+                )
+                deltas.append(mae_shuf - base_mae)
+
+            importances.append((" + ".join(group), float(np.mean(deltas)), float(np.std(deltas))))
+
+        imp_df = pd.DataFrame(importances, columns=["feature_group", "mae_increase", "std"]).sort_values("mae_increase", ascending=False)
+
+    # ---- ORIGINAL SINGLE FEATURE PERMUTATION ----
+    else:
+        for i, name in enumerate(feat_names):
+            deltas = []
+            for r in range(repeats):
+                arr = x_np.copy()
+                rng = np.random.RandomState(seed + r)
+                rng.shuffle(arr[:, i])
+
+                mae_shuf, _, _ = compute_mae_preds(
+                    model, torch.tensor(arr, dtype=torch.float32), y_tensor
+                )
+                deltas.append(mae_shuf - base_mae)
+
+            importances.append((name, float(np.mean(deltas)), float(np.std(deltas))))
+
+        imp_df = pd.DataFrame(importances, columns=["feature", "mae_increase", "std"]).sort_values("mae_increase", ascending=False)
+
+    # ---- SAVE ----
+    if out_dir is not None:
+        imp_df.to_csv(os.path.join(out_dir, f"{stem}_permutation_importance.csv"), index=False)
+
     return imp_df
     
-def main(csv_path,SEED,feature_stats_path):
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    out_dir = f'explaincdr_seed{SEED}'
+def main(csv_path,seed,feature_stats_path):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    out_dir = f'explaincdr_seed{seed}'
     os.makedirs(out_dir,exist_ok=True)
     print("Device:", DEVICE)
     df = pd.read_csv(csv_path)
@@ -155,15 +194,15 @@ def main(csv_path,SEED,feature_stats_path):
     df_feats = df.iloc[:, cols].copy()
 
     # attach metadata (keeps them but we won't drop rows)
-    required = ['age','RID']
+    required = ['age','subject']
     for r in required:
         if r not in df.columns:
             raise KeyError(f"Missing required column: {r}")
     df_feats['age'] = df['age']
-    df_feats['RID'] = df['RID']
+    df_feats['subject'] = df['subject']
 
     # full-dataset feature matrix & target
-    drop_cols = ['age','RID']
+    drop_cols = ['age','subject']
     stats_df = load_feature_stats(feature_stats_path)
     
     
@@ -247,9 +286,18 @@ def main(csv_path,SEED,feature_stats_path):
         print(f"Permutation limited to top {len(perm_feat_names)} features (by abs corr with age).")
 
     # Run permutation importance (units matching model outputs)
+    # get all grouped features
+    grouped_feats = set(f for group in groups for f in group)
+
+    # find leftover features
+    leftover = [f for f in perm_feat_names if f not in grouped_feats]
+
+    # turn leftovers into single-feature groups
+    for f in leftover:
+        groups.append([f])
     perm_df = permutation_importance(
         model, perm_X_tensor, y_for_metric, perm_feat_names,
-        repeats=PERM_REPEATS, out_dir=out_dir, stem=stem, SEED=SEED
+        repeats=PERM_REPEATS, out_dir=out_dir, stem=stem, seed=seed,groups=groups
     )
     perm_df.to_csv(os.path.join(out_dir, f'{stem}_permutation_interpret.csv'), index=False)
 
@@ -265,6 +313,6 @@ parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--feature-stats', type=str, required=True)
 args = parser.parse_args()
 
-main(csv_path=args.csv,SEED=args.seed,feature_stats_path=args.feature_stats)
+main(csv_path=args.csv,seed=args.seed,feature_stats_path=args.feature_stats)
     
 
